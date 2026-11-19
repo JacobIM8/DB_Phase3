@@ -348,6 +348,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $task !== '') {
                 break;
 
             case 'q1':
+
                 if ($selectedTable === '') {
                     throw new InvalidArgumentException('Choose a table to search.');
                 }
