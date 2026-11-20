@@ -30,6 +30,25 @@ function renderResults(array $rows): void
     echo '</tbody></table>';
 }
 
+/**
+ * Build a readable copy of a prepared statement with its values filled in,
+ * so the page can show the SQL that ran. For display only; never execute it.
+ */
+function formatSqlForDisplay(string $sql, array $values = []): string
+{
+    $lines = array_map('trim', explode("\n", $sql));
+    $sql = implode("\n", array_filter($lines, static fn (string $line): bool => $line !== ''));
+
+    return preg_replace_callback('/\?/', static function () use (&$values): string {
+        $value = array_shift($values);
+        if ($value === null) {
+            return 'NULL';
+        }
+        $value = (string) $value;
+        return is_numeric($value) ? $value : "'" . str_replace("'", "''", $value) . "'";
+    }, $sql);
+}
+
 function quoteIdentifier(string $identifier): string
 {
     return '`' . str_replace('`', '``', $identifier) . '`';
@@ -53,7 +72,7 @@ function executeWithValues(mysqli $conn, string $sql, array $values): mysqli_stm
 }
 
 $tasks = [
-    'q1' => 'Search rows in a table',
+    'q1' => 'Find employees hired on or after a date',
     'q2' => 'Insert a row',
     'q3' => 'Update rows',
     'q4' => 'Delete rows',
@@ -67,6 +86,7 @@ $task = $_SERVER['REQUEST_METHOD'] === 'POST'
 $task = is_string($task) && isset($tasks[$task]) ? $task : '';
 $message = null;
 $error = null;
+$executedSql = [];
 $rows = [];
 $dateValue = '';
 $tablesResult = mysqli_query(
@@ -344,44 +364,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $task !== '') {
                 }
                 mysqli_stmt_execute($statement);
                 $rows = mysqli_fetch_all(mysqli_stmt_get_result($statement), MYSQLI_ASSOC);
+                $executedSql[] = formatSqlForDisplay($query, $parameters);
                 $message = 'Query completed successfully.';
                 break;
 
             case 'q1':
-
-                if ($selectedTable === '') {
-                    throw new InvalidArgumentException('Choose a table to search.');
+                // Q1: employees hired on or after the entered date, joined to their department.
+                $dateValue = is_string($_POST['hire_date'] ?? null) ? trim($_POST['hire_date']) : '';
+                $parsedDate = DateTime::createFromFormat('!Y-m-d', $dateValue);
+                if ($parsedDate === false || $parsedDate->format('Y-m-d') !== $dateValue) {
+                    throw new InvalidArgumentException('Enter a valid hire date (YYYY-MM-DD).');
                 }
 
-                $query = 'SELECT * FROM ' . quoteIdentifier($selectedTable);
-                $searchValues = [];
-                if ($searchColumn !== '') {
-                    if (!in_array($searchColumn, array_column($tableColumns, 'COLUMN_NAME'), true)
-                        || !in_array($searchOperator, $whereOperators, true)) {
-                        throw new InvalidArgumentException('Choose a valid search column and comparison.');
-                    }
-
-                    $quotedSearchColumn = quoteIdentifier($searchColumn);
-                    if ($searchOperator === 'IS NULL' || $searchOperator === 'IS NOT NULL') {
-                        $query .= ' WHERE ' . $quotedSearchColumn . ' ' . $searchOperator;
-                    } elseif ($searchOperator === 'BETWEEN') {
-                        if ($searchValue === '' || $searchValue2 === '') {
-                            throw new InvalidArgumentException('Enter both values for the range search.');
-                        }
-                        $query .= ' WHERE ' . $quotedSearchColumn . ' BETWEEN ? AND ?';
-                        $searchValues = [$searchValue, $searchValue2];
-                    } else {
-                        if ($searchValue === '') {
-                            throw new InvalidArgumentException('Enter a value for the search.');
-                        }
-                        $query .= ' WHERE ' . $quotedSearchColumn . ' ' . $searchOperator . ' ?';
-                        $searchValues[] = $searchValue;
-                    }
-                }
-
-                $statement = executeWithValues($conn, $query, $searchValues);
+                $q1Sql = 'SELECT e.Emp_ID AS EmployeeID,
+                            CONCAT(e.Fname, \' \', e.Lname) AS FullName,
+                            e.Hire_Date AS HireDate,
+                            d.Dept_Name AS DepartmentName,
+                            d.Floor_No AS FloorNumber
+                     FROM EMPLOYEE e
+                     LEFT JOIN DEPARTMENT d ON d.Dept_ID = e.Dept_ID
+                     WHERE e.Hire_Date >= ?
+                     ORDER BY e.Hire_Date, e.Emp_ID';
+                $statement = executeWithValues($conn, $q1Sql, [$dateValue]);
                 $rows = mysqli_fetch_all(mysqli_stmt_get_result($statement), MYSQLI_ASSOC);
-                $message = 'Search completed in ' . $selectedTable . '.';
+                $executedSql[] = formatSqlForDisplay($q1Sql, [$dateValue]);
+                $message = count($rows) . ' employee(s) hired on or after ' . $dateValue . '.';
                 break;
 
             case 'q2':
@@ -421,6 +428,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $task !== '') {
                         . ' (' . implode(', ', $insertColumns) . ') VALUES (' . $placeholders . ')';
                 }
                 $insertStatement = executeWithValues($conn, $insertSql, $insertValues);
+                $executedSql[] = formatSqlForDisplay($insertSql, $insertValues);
                 $message = 'Row inserted into ' . $selectedTable . '.';
 
                 if ($primaryColumns !== []) {
@@ -442,12 +450,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $task !== '') {
                             static fn ($column): string => quoteIdentifier($column['COLUMN_NAME']) . ' = ?',
                             $primaryColumns
                         ));
-                        $selectStatement = executeWithValues(
-                            $conn,
-                            'SELECT * FROM ' . quoteIdentifier($selectedTable) . ' WHERE ' . $where,
-                            $primaryValues
-                        );
+                        $insertedSelectSql = 'SELECT * FROM ' . quoteIdentifier($selectedTable) . ' WHERE ' . $where;
+                        $selectStatement = executeWithValues($conn, $insertedSelectSql, $primaryValues);
                         $rows = mysqli_fetch_all(mysqli_stmt_get_result($selectStatement), MYSQLI_ASSOC);
+                        $executedSql[] = formatSqlForDisplay($insertedSelectSql, $primaryValues);
                     }
                 }
                 break;
@@ -464,24 +470,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $task !== '') {
                     throw new InvalidArgumentException('Choose a condition column and enter its matching value.');
                 }
 
-                $updateStatement = executeWithValues(
-                    $conn,
-                    'UPDATE ' . quoteIdentifier($selectedTable)
+                $updateSql = 'UPDATE ' . quoteIdentifier($selectedTable)
                     . ' SET ' . quoteIdentifier($changedColumn) . ' = ?'
-                    . ' WHERE ' . quoteIdentifier($conditionColumn) . ' = ?',
-                    [$changedValue, $conditionValue]
-                );
+                    . ' WHERE ' . quoteIdentifier($conditionColumn) . ' = ?';
+                $updateValues = [$changedValue, $conditionValue];
+                $updateStatement = executeWithValues($conn, $updateSql, $updateValues);
+                $executedSql[] = formatSqlForDisplay($updateSql, $updateValues);
                 $affectedRows = mysqli_stmt_affected_rows($updateStatement);
                 $message = $affectedRows === 0
                     ? 'No matching rows were changed.'
                     : $affectedRows . ' row(s) updated.';
-                $selectStatement = executeWithValues(
-                    $conn,
-                    'SELECT * FROM ' . quoteIdentifier($selectedTable)
-                    . ' WHERE ' . quoteIdentifier($conditionColumn) . ' = ?',
-                    [$changedColumn === $conditionColumn ? $changedValue : $conditionValue]
-                );
+                $updatedSelectSql = 'SELECT * FROM ' . quoteIdentifier($selectedTable)
+                    . ' WHERE ' . quoteIdentifier($conditionColumn) . ' = ?';
+                $updatedSelectValues = [$changedColumn === $conditionColumn ? $changedValue : $conditionValue];
+                $selectStatement = executeWithValues($conn, $updatedSelectSql, $updatedSelectValues);
                 $rows = mysqli_fetch_all(mysqli_stmt_get_result($selectStatement), MYSQLI_ASSOC);
+                $executedSql[] = formatSqlForDisplay($updatedSelectSql, $updatedSelectValues);
                 break;
 
             case 'q4':
@@ -496,12 +500,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $task !== '') {
                     throw new InvalidArgumentException('Confirm the deletion before continuing.');
                 }
 
-                $deleteStatement = executeWithValues(
-                    $conn,
-                    'DELETE FROM ' . quoteIdentifier($selectedTable)
-                    . ' WHERE ' . quoteIdentifier($conditionColumn) . ' = ?',
-                    [$conditionValue]
-                );
+                $deleteSql = 'DELETE FROM ' . quoteIdentifier($selectedTable)
+                    . ' WHERE ' . quoteIdentifier($conditionColumn) . ' = ?';
+                $deleteStatement = executeWithValues($conn, $deleteSql, [$conditionValue]);
+                $executedSql[] = formatSqlForDisplay($deleteSql, [$conditionValue]);
                 $affectedRows = mysqli_stmt_affected_rows($deleteStatement);
                 $message = $affectedRows === 0
                     ? 'No matching rows found; nothing was deleted.'
@@ -509,9 +511,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $task !== '') {
                 break;
 
             case 'qv1':
-                mysqli_query(
-                    $conn,
-                    'CREATE OR REPLACE VIEW SalesEmployeeView AS
+                $viewSql = 'CREATE OR REPLACE VIEW SalesEmployeeView AS
                      SELECT e.Emp_ID AS EmpID,
                             CONCAT_WS(\' \', e.Fname, e.Lname) AS EmployeeName,
                             d.Dept_Name AS DepartmentName,
@@ -526,8 +526,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $task !== '') {
                      LEFT JOIN DEPARTMENT d ON d.Dept_ID = e.Dept_ID
                      JOIN SHOE sh ON sh.Shoe_ID = sr.Shoe_ID
                      JOIN CUSTOMER c ON c.Customer_ID = sr.Customer_ID
-                     ORDER BY EmployeeName'
-                );
+                     ORDER BY EmployeeName';
+                mysqli_query($conn, $viewSql);
+                $executedSql[] = formatSqlForDisplay($viewSql);
                 $message = 'SalesEmployeeView was created or replaced successfully.';
                 break;
 
@@ -557,6 +558,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $task !== '') {
         th { background: #eee; }
         .message { color: #155724; }
         .error { color: #9b1c1c; }
+        .sql { background: #f6f6f6; border: 1px solid #999; margin-top: 1rem; padding: 0.75rem; white-space: pre-wrap; }
     </style>
 </head>
 <body>
@@ -575,7 +577,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $task !== '') {
         <noscript><button type="submit">Choose task</button></noscript>
     </form>
 
-    <?php if (in_array($task, ['q1', 'q2', 'q3', 'q4'], true)): ?>
+    <?php if (in_array($task, ['q2', 'q3', 'q4'], true)): ?>
         <form method="get">
             <input type="hidden" name="task" value="<?= escapeHtml($task) ?>">
             <label for="table">Table</label>
@@ -598,34 +600,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $task !== '') {
             <input type="hidden" name="table" value="<?= escapeHtml($selectedTable) ?>">
 
             <?php if ($task === 'q1'): ?>
-                <?php if ($selectedTable === ''): ?>
-                    <p>Choose a table above, then choose a column and enter search criteria.</p>
-                <?php else: ?>
-                    <label for="search_column">Column to search (optional)</label>
-                    <select id="search_column" name="search_column">
-                        <option value="">All rows</option>
-                        <?php foreach ($tableColumns as $column): ?>
-                            <option value="<?= escapeHtml($column['COLUMN_NAME']) ?>"
-                                <?= $searchColumn === $column['COLUMN_NAME'] ? 'selected' : '' ?>>
-                                <?= escapeHtml($column['COLUMN_NAME']) ?>
-                            </option>
-                        <?php endforeach; ?>
-                    </select>
-                    <label for="search_operator">Comparison</label>
-                    <select id="search_operator" name="search_operator">
-                        <?php foreach ($whereOperators as $operator): ?>
-                            <option value="<?= escapeHtml($operator) ?>"
-                                <?= $searchOperator === $operator ? 'selected' : '' ?>>
-                                <?= escapeHtml($operator) ?>
-                            </option>
-                        <?php endforeach; ?>
-                    </select>
-                    <label for="search_value">Value</label>
-                    <input id="search_value" name="search_value" value="<?= escapeHtml($searchValue) ?>">
-                    <label for="search_value2">Second value (BETWEEN only)</label>
-                    <input id="search_value2" name="search_value2" value="<?= escapeHtml($searchValue2) ?>">
-                    <button type="submit">Search rows</button>
-                <?php endif; ?>
+                <label for="hire_date">Show employees hired on or after</label>
+                <input type="date" id="hire_date" name="hire_date"
+                    value="<?= escapeHtml($dateValue) ?>" required>
+                <button type="submit">Find employees</button>
             <?php elseif ($task === 'q2'): ?>
                 <?php if ($selectedTable === ''): ?>
                     <p>Choose a table above to load its columns.</p>
@@ -811,10 +789,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $task !== '') {
     <?php if ($message !== null): ?>
         <p class="message" role="status"><?= escapeHtml($message) ?></p>
     <?php endif; ?>
+    <?php if ($executedSql !== [] && $error === null): ?>
+        <p><strong>SQL executed:</strong></p>
+        <pre class="sql"><?= escapeHtml(implode(";\n\n", $executedSql) . ';') ?></pre>
+    <?php endif; ?>
     <?php if ($error !== null): ?>
         <p class="error" role="alert"><?= escapeHtml($error) ?></p>
     <?php endif; ?>
-    <?php if ($rows !== [] || in_array($task, ['q1', 'q2', 'q3', 'q4'], true)
+    <?php if ($rows !== [] || in_array($task, ['q1', 'q2', 'q3'], true)
         && $_SERVER['REQUEST_METHOD'] === 'POST' && $error === null): ?>
         <?php renderResults($rows); ?>
     <?php endif; ?>
